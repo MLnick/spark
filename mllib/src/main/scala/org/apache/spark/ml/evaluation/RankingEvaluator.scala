@@ -111,7 +111,7 @@ final class RankingEvaluator @Since("2.0.0") (@Since("2.0.0") override val uid: 
    *
    * @group param
    */
-  val relevanceCol: Param[String] = new Param(this, "k", "column name containing the " +
+  val relevanceCol: Param[String] = new Param(this, "relevanceCol", "column name containing the " +
     "'relevance score for each predicted document in 'predictionCol'.")
 
   /** @group getParam */
@@ -130,10 +130,11 @@ final class RankingEvaluator @Since("2.0.0") (@Since("2.0.0") override val uid: 
   @Since("2.0.0")
   def setLabelCol(value: String): this.type = set(labelCol, value)
 
-  setDefault(metricName -> "map", k -> 10)
+  setDefault(metricName -> "map", k -> 10, queryCol -> "query", relevanceCol -> "relevance")
 
   private def validateSchema(dataset: Dataset[_]): Unit = {
     val schema = dataset.schema
+    require(schema($(labelCol)).dataType.sameType(schema($(predictionCol)).dataType))
     // we handle common types for 'query id', 'document id'
     // val idTypes = Seq(IntegerType, LongType, StringType)
     // SchemaUtils.checkColumnTypes(schema, $(predictionCol), idTypes)
@@ -154,13 +155,13 @@ final class RankingEvaluator @Since("2.0.0") (@Since("2.0.0") override val uid: 
         // label, prediction, and relevance cols are nullable, so wrap them in Options
         val actual = Option(row.get(1))
         val predicted = Option(row.get(2)).map((_, row.getDouble(3)))
-        (qid, (actual, predicted))
+        (qid, (predicted, actual))
       }.aggregateByKey(new RankingAggregator)(
         // TODO optimize for known k?
         // TODO use native Spark versions of 'collect_list' and 'collect_set' when available?
-        seqOp = { case (agg, (actual, predScores)) => agg.add(actual, predScores) },
+        seqOp = { case (agg, (predScores, actual)) => agg.add(actual, predScores) },
         combOp = { case (left, right) => new RankingAggregator().merge(left).merge(right) }
-      ).mapValues(agg => (agg.getActuals, agg.getPredicted)).values
+      ).mapValues(agg => (agg.getPredicted, agg.getActuals)).values
 
     val metrics = new RankingMetrics(predictedAndActual)
     $(metricName) match {
@@ -172,11 +173,11 @@ final class RankingEvaluator @Since("2.0.0") (@Since("2.0.0") override val uid: 
   }
 
   @Since("1.5.0")
-  override def copy(extra: ParamMap): RegressionEvaluator = defaultCopy(extra)
+  override def copy(extra: ParamMap): RankingEvaluator = defaultCopy(extra)
 }
 
 @Since("2.0.0")
-object RankingEvaluator extends DefaultParamsReadable[RegressionEvaluator] {
+object RankingEvaluator extends DefaultParamsReadable[RankingEvaluator] {
 
   private final val supportedMetrics = Array("map", "mapk", "ndcg")
 
@@ -202,9 +203,9 @@ object RankingEvaluator extends DefaultParamsReadable[RegressionEvaluator] {
 
     def getActuals: Array[Any] = actuals.toArray
 
-    def getPredicted: Array[Any] = predictedWithScores.map(_._1).toArray
+    def getPredicted: Array[Any] = predictedWithScores.toArray.map(_._1)
   }
 
   @Since("1.6.0")
-  override def load(path: String): RegressionEvaluator = super.load(path)
+  override def load(path: String): RankingEvaluator = super.load(path)
 }
