@@ -38,7 +38,7 @@ import org.apache.spark.mllib.util.MLlibTestSparkContext
 import org.apache.spark.mllib.util.TestingUtils._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.{SparkListener, SparkListenerStageCompleted}
-import org.apache.spark.sql.{DataFrame, Row, SQLContext}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SQLContext}
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.util.Utils
 
@@ -261,7 +261,7 @@ class ALSSuite
       numItems: Int,
       rank: Int,
       noiseStd: Double = 0.0,
-      seed: Long = 11L): (RDD[Rating[Int]], RDD[Rating[Int]]) = {
+      seed: Long = 11L): (Dataset[Rating[Int]], Dataset[Rating[Int]]) = {
     ALSSuite.genImplicitTestData(sc, numUsers, numItems, rank, noiseStd, seed)
   }
 
@@ -397,21 +397,25 @@ class ALSSuite
     import sqlContext.implicits._
     val (ratings, _) = genImplicitTestData(numUsers = 20, numItems = 40, rank = 2, noiseStd = 0.01)
 
-    // val longRatings = ratings.map(r => Rating[Long](r.user.toLong, r.item.toLong, r.rating))
-    // val (longUserFactors, _) = ALS.train(longRatings, rank = 2, maxIter = 4, seed = 0)
-    // assert(longUserFactors.first()._1.getClass === classOf[Long])
+    val rdd = ratings.rdd
 
-    val strRatings = ratings.map(r => Rating[String](r.user.toString, r.item.toString, r.rating))
+    val longRatings = rdd.map(r => Rating[Long](r.user.toLong, r.item.toLong, r.rating)).toDS
+    val (longUserFactors, _) = ALS.train(longRatings, rank = 2, maxIter = 4, seed = 0)
+    assert(longUserFactors.first()._1.getClass === classOf[Long])
+
+    val strRatings = rdd.map(r => Rating[String](r.user.toString, r.item.toString, r.rating)).toDS
     val (strUserFactors, _) = ALS.train(strRatings, rank = 2, maxIter = 4, seed = 0)
     assert(strUserFactors.first()._1.getClass === classOf[String])
   }
 
   test("nonnegative constraint") {
+    val sqlContext = this.sqlContext
+    import sqlContext.implicits._
     val (ratings, _) = genImplicitTestData(numUsers = 20, numItems = 40, rank = 2, noiseStd = 0.01)
     val (userFactors, itemFactors) =
       ALS.train(ratings, rank = 2, maxIter = 4, nonnegative = true, seed = 0)
-    def isNonnegative(factors: RDD[(Int, Array[Float])]): Boolean = {
-      factors.values.map { _.forall(_ >= 0.0) }.reduce(_ && _)
+    def isNonnegative(factors: Dataset[(Int, Array[Float])]): Boolean = {
+      factors.map { case (_, values) => values.forall(_ >= 0.0) }.reduce(_ && _)
     }
     assert(isNonnegative(userFactors))
     assert(isNonnegative(itemFactors))
@@ -435,9 +439,9 @@ class ALSSuite
     val (userFactors, itemFactors) = ALS.train(
       ratings, rank = 2, maxIter = 4, numUserBlocks = 3, numItemBlocks = 4, seed = 0)
     for ((tpe, factors) <- Seq(("User", userFactors), ("Item", itemFactors))) {
-      assert(userFactors.partitioner.isDefined, s"$tpe factors should have partitioner.")
-      val part = userFactors.partitioner.get
-      userFactors.mapPartitionsWithIndex { (idx, items) =>
+      assert(userFactors.rdd.partitioner.isDefined, s"$tpe factors should have partitioner.")
+      val part = userFactors.rdd.partitioner.get
+      userFactors.rdd.mapPartitionsWithIndex { (idx, items) =>
         items.foreach { case (id, _) =>
           if (part.getPartition(id) != idx) {
             throw new SparkException(s"$tpe with ID $id should not be in partition $idx.")
@@ -708,7 +712,9 @@ object ALSSuite extends Logging {
       numItems: Int,
       rank: Int,
       noiseStd: Double = 0.0,
-      seed: Long = 11L): (RDD[Rating[Int]], RDD[Rating[Int]]) = {
+      seed: Long = 11L): (Dataset[Rating[Int]], Dataset[Rating[Int]]) = {
+    val sqlContext = SQLContext.getOrCreate(sc)
+    import sqlContext.implicits._
     // The assumption of the implicit feedback model is that unobserved ratings are more likely to
     // be negatives.
     val positiveFraction = 0.8
@@ -739,6 +745,6 @@ object ALSSuite extends Logging {
     }
     logInfo(s"Generated an implicit feedback dataset with ${training.size} ratings for training " +
       s"and ${test.size} for test.")
-    (sc.parallelize(training, 2), sc.parallelize(test, 2))
+    (sc.parallelize(training, 2).toDS, sc.parallelize(test, 2).toDS)
   }
 }

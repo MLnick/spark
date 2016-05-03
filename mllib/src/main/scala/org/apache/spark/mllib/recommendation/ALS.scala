@@ -267,10 +267,12 @@ class ALS private (
       seed = seed)
 
     val userFactors = floatUserFactors
+      .rdd
       .mapValues(_.map(_.toDouble))
       .setName("users")
       .persist(finalRDDStorageLevel)
     val prodFactors = floatProdFactors
+      .rdd
       .mapValues(_.map(_.toDouble))
       .setName("products")
       .persist(finalRDDStorageLevel)

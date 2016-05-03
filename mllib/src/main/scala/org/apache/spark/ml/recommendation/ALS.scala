@@ -22,11 +22,12 @@ import java.io.IOException
 
 import scala.collection.mutable
 import scala.reflect.ClassTag
+import scala.reflect.runtime.universe.TypeTag
 import scala.util.{Sorting, Try}
 import scala.util.hashing.byteswap64
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.hadoop.fs.Path
 import org.json4s.DefaultFormats
 import org.json4s.JsonDSL._
 
@@ -641,7 +642,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
    * Implementation of the ALS algorithm.
    */
   @DeveloperApi
-  def train[ID: ClassTag]( // scalastyle:ignore
+  def train[ID: ClassTag: TypeTag]( // scalastyle:ignore
       ratings: Dataset[Rating[ID]],
       rank: Int = 10,
       numUserBlocks: Int = 10,
@@ -655,9 +656,11 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       finalRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK,
       checkpointInterval: Int = 10,
       seed: Long = 0L)(
-      implicit ord: Ordering[ID]): (RDD[(ID, Array[Float])], RDD[(ID, Array[Float])]) = {
+      implicit ord: Ordering[ID]): (Dataset[(ID, Array[Float])], Dataset[(ID, Array[Float])]) = {
     require(intermediateRDDStorageLevel != StorageLevel.NONE,
       "ALS is not designed to run without persisting intermediate RDDs.")
+    val sqlContext = ratings.sqlContext
+    import sqlContext.implicits._
     val ratingsRDD = ratings.rdd
     val sc = ratings.sparkSession.sparkContext
     val userPart = new ALSPartitioner(numUserBlocks)
@@ -766,7 +769,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       itemOutBlocks.unpersist()
       blockRatings.unpersist()
     }
-    (userIdAndFactors, itemIdAndFactors)
+    (userIdAndFactors.toDS, itemIdAndFactors.toDS)
   }
 
   /**
