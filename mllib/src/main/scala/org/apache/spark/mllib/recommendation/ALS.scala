@@ -22,6 +22,7 @@ import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.internal.Logging
 import org.apache.spark.ml.recommendation.{ALS => NewALS}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.SQLContext
 import org.apache.spark.storage.StorageLevel
 
 /**
@@ -236,6 +237,8 @@ class ALS private (
   @Since("0.8.0")
   def run(ratings: RDD[Rating]): MatrixFactorizationModel = {
     val sc = ratings.context
+    val sqlContext = SQLContext.getOrCreate(sc)
+    import sqlContext.implicits._
 
     val numUserBlocks = if (this.numUserBlocks == -1) {
       math.max(sc.defaultParallelism, ratings.partitions.length / 2)
@@ -249,7 +252,7 @@ class ALS private (
     }
 
     val (floatUserFactors, floatProdFactors) = NewALS.train[Int](
-      ratings = ratings.map(r => NewALS.Rating(r.user, r.product, r.rating.toFloat)),
+      ratings = ratings.map(r => NewALS.Rating(r.user, r.product, r.rating.toFloat)).toDS,
       rank = rank,
       numUserBlocks = numUserBlocks,
       numItemBlocks = numProductBlocks,

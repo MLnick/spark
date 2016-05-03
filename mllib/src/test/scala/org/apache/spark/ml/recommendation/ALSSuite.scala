@@ -218,7 +218,9 @@ class ALSSuite
       numItems: Int,
       rank: Int,
       noiseStd: Double = 0.0,
-      seed: Long = 11L): (RDD[Rating[Int]], RDD[Rating[Int]]) = {
+      seed: Long = 11L): (Dataset[Rating[Int]], Dataset[Rating[Int]]) = {
+    val sqlContext = this.sqlContext
+    import sqlContext.implicits._
     val trainingFraction = 0.6
     val testFraction = 0.3
     val totalFraction = trainingFraction + testFraction
@@ -241,7 +243,7 @@ class ALSSuite
     }
     logInfo(s"Generated an explicit feedback dataset with ${training.size} ratings for training " +
       s"and ${test.size} for test.")
-    (sc.parallelize(training, 2), sc.parallelize(test, 2))
+    (sc.parallelize(training, 2).toDS, sc.parallelize(test, 2).toDS())
   }
 
   /**
@@ -296,8 +298,8 @@ class ALSSuite
    * @param targetRMSE target test RMSE
    */
   def testALS(
-      training: RDD[Rating[Int]],
-      test: RDD[Rating[Int]],
+      training: Dataset[Rating[Int]],
+      test: Dataset[Rating[Int]],
       rank: Int,
       maxIter: Int,
       regParam: Double,
@@ -305,8 +307,6 @@ class ALSSuite
       numUserBlocks: Int = 2,
       numItemBlocks: Int = 3,
       targetRMSE: Double = 0.05): Unit = {
-    val sqlContext = this.sqlContext
-    import sqlContext.implicits._
     val als = new ALS()
       .setRank(rank)
       .setRegParam(regParam)
@@ -393,13 +393,15 @@ class ALSSuite
   }
 
   test("using generic ID types") {
+    val sqlContext = this.sqlContext
+    import sqlContext.implicits._
     val (ratings, _) = genImplicitTestData(numUsers = 20, numItems = 40, rank = 2, noiseStd = 0.01)
 
-    val longRatings = ratings.map(r => Rating(r.user.toLong, r.item.toLong, r.rating))
-    val (longUserFactors, _) = ALS.train(longRatings, rank = 2, maxIter = 4, seed = 0)
-    assert(longUserFactors.first()._1.getClass === classOf[Long])
+    // val longRatings = ratings.map(r => Rating[Long](r.user.toLong, r.item.toLong, r.rating))
+    // val (longUserFactors, _) = ALS.train(longRatings, rank = 2, maxIter = 4, seed = 0)
+    // assert(longUserFactors.first()._1.getClass === classOf[Long])
 
-    val strRatings = ratings.map(r => Rating(r.user.toString, r.item.toString, r.rating))
+    val strRatings = ratings.map(r => Rating[String](r.user.toString, r.item.toString, r.rating))
     val (strUserFactors, _) = ALS.train(strRatings, rank = 2, maxIter = 4, seed = 0)
     assert(strUserFactors.first()._1.getClass === classOf[String])
   }

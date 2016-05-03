@@ -434,10 +434,7 @@ class ALS(@Since("1.4.0") override val uid: String) extends Estimator[ALSModel] 
     val r = if ($(ratingCol) != "") col($(ratingCol)).cast(FloatType) else lit(1.0f)
     val ratings = dataset
       .select(col($(userCol)).cast(IntegerType), col($(itemCol)).cast(IntegerType), r)
-      .rdd
-      .map { row =>
-        Rating(row.getInt(0), row.getInt(1), row.getFloat(2))
-      }
+      .as[Rating[Int]]
     val instrLog = Instrumentation.create(this, ratings)
     instrLog.logParams(rank, numUserBlocks, numItemBlocks, implicitPrefs, alpha,
                        userCol, itemCol, ratingCol, predictionCol, maxIter,
@@ -645,7 +642,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
    */
   @DeveloperApi
   def train[ID: ClassTag]( // scalastyle:ignore
-      ratings: RDD[Rating[ID]],
+      ratings: Dataset[Rating[ID]],
       rank: Int = 10,
       numUserBlocks: Int = 10,
       numItemBlocks: Int = 10,
@@ -661,13 +658,14 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       implicit ord: Ordering[ID]): (RDD[(ID, Array[Float])], RDD[(ID, Array[Float])]) = {
     require(intermediateRDDStorageLevel != StorageLevel.NONE,
       "ALS is not designed to run without persisting intermediate RDDs.")
-    val sc = ratings.sparkContext
+    val ratingsRDD = ratings.rdd
+    val sc = ratings.sparkSession.sparkContext
     val userPart = new ALSPartitioner(numUserBlocks)
     val itemPart = new ALSPartitioner(numItemBlocks)
     val userLocalIndexEncoder = new LocalIndexEncoder(userPart.numPartitions)
     val itemLocalIndexEncoder = new LocalIndexEncoder(itemPart.numPartitions)
     val solver = if (nonnegative) new NNLSSolver else new CholeskySolver
-    val blockRatings = partitionRatings(ratings, userPart, itemPart)
+    val blockRatings = partitionRatings(ratingsRDD, userPart, itemPart)
       .persist(intermediateRDDStorageLevel)
     val (userInBlocks, userOutBlocks) =
       makeBlocks("user", blockRatings, userPart, itemPart, intermediateRDDStorageLevel)
