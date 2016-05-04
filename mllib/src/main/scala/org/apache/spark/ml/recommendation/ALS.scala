@@ -71,6 +71,23 @@ private[recommendation] trait ALSModelParams extends Params with HasPredictionCo
 
   /** @group getParam */
   def getItemCol: String = $(itemCol)
+
+  /**
+   * Param for strategy for dealing with unknown users or items at prediction time.
+   * Supported values:
+   * - "nan" prediction value for unknown ids will be NaN.
+   * - "drop" rows in the input DataFrame containing unknown ids will be dropped.
+   * Default: "nan".
+   *
+   * @group expertParam
+   */
+  val unknownStrategy = new Param[String](this, "unknownStrategy",
+    "strategy for dealing with unknown users or items at prediction time. Supported values: " +
+    s"${ALSModel.supportedUnknownStrategies.mkString(",")}.",
+    ParamValidators.inArray(ALSModel.supportedUnknownStrategies))
+
+  /** @group expertGetParam */
+  def getUnknownStrategy: String = $(unknownStrategy)
 }
 
 /**
@@ -183,7 +200,7 @@ private[recommendation] trait ALSParams extends ALSModelParams with HasMaxIter w
 
   setDefault(rank -> 10, maxIter -> 10, regParam -> 0.1, numUserBlocks -> 10, numItemBlocks -> 10,
     implicitPrefs -> false, alpha -> 1.0, userCol -> "user", itemCol -> "item",
-    ratingCol -> "rating", nonnegative -> false, checkpointInterval -> 10,
+    ratingCol -> "rating", nonnegative -> false, checkpointInterval -> 10, unknownStrategy -> "nan",
     intermediateStorageLevel -> "MEMORY_AND_DISK", finalStorageLevel -> "MEMORY_AND_DISK")
 
   /**
@@ -230,6 +247,10 @@ class ALSModel private[ml] (
   @Since("1.3.0")
   def setPredictionCol(value: String): this.type = set(predictionCol, value)
 
+  /** @group expertSetParam */
+  @Since("2.0.0")
+  def setUnknownStrategy(value: String): this.type = set(unknownStrategy, value)
+
   @Since("2.0.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
     // Register a UDF for DataFrame, and then
@@ -241,11 +262,17 @@ class ALSModel private[ml] (
         Float.NaN
       }
     }
-    dataset
+    val predictions = dataset
       .join(userFactors, dataset($(userCol)) === userFactors("id"), "left")
       .join(itemFactors, dataset($(itemCol)) === itemFactors("id"), "left")
       .select(dataset("*"),
         predict(userFactors("features"), itemFactors("features")).as($(predictionCol)))
+    $(unknownStrategy) match {
+      case ALSModel.Drop =>
+        predictions.na.drop("all", Seq($(predictionCol)))
+      case ALSModel.NaN =>
+        predictions
+    }
   }
 
   @Since("1.3.0")
@@ -267,6 +294,10 @@ class ALSModel private[ml] (
 
 @Since("1.6.0")
 object ALSModel extends MLReadable[ALSModel] {
+
+  private val NaN = "nan"
+  private val Drop = "drop"
+  private[recommendation] final val supportedUnknownStrategies = Array(NaN, Drop)
 
   @Since("1.6.0")
   override def read: MLReader[ALSModel] = new ALSModelReader
@@ -406,15 +437,15 @@ class ALS(@Since("1.4.0") override val uid: String) extends Estimator[ALSModel] 
 
   /** @group expertSetParam */
   @Since("2.0.0")
-  def setIntermediateStorageLevel(value: String): this.type = {
-    set(intermediateStorageLevel, value)
-  }
+  def setIntermediateStorageLevel(value: String): this.type = set(intermediateStorageLevel, value)
 
   /** @group expertSetParam */
   @Since("2.0.0")
-  def setFinalStorageLevel(value: String): this.type = {
-    set(finalStorageLevel, value)
-  }
+  def setFinalStorageLevel(value: String): this.type = set(finalStorageLevel, value)
+
+  /** @group expertSetParam */
+  @Since("2.0.0")
+  def setUnknownStrategy(value: String): this.type = set(unknownStrategy, value)
 
   /**
    * Sets both numUserBlocks and numItemBlocks to the specific value.
