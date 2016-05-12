@@ -50,6 +50,7 @@ class Param(object):
         self.name = str(name)
         self.doc = str(doc)
         self.typeConverter = TypeConverters.identity if typeConverter is None else typeConverter
+        self.__doc__ = str(doc)
 
     def _copy_new_parent(self, parent):
         """Copy the current param to a new parent, must be a dummy param."""

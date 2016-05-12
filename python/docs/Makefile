@@ -8,6 +8,7 @@ PAPER         ?=
 BUILDDIR      ?= _build
 
 export PYTHONPATH=$(realpath ..):$(realpath ../lib/py4j-0.9.2-src.zip)
+export SPARK_HOME=$(realpath ../../)
 
 # User-friendly check for sphinx-build
 ifeq ($(shell which $(SPHINXBUILD) >/dev/null 2>&1; echo $$?), 1)
