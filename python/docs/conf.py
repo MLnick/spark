@@ -341,8 +341,10 @@ epub_exclude_files = ['search.html']
 # Skip sample endpoint link (not expected to resolve)
 linkcheck_ignore = [r'https://kinesis.us-east-1.amazonaws.com']
 
-# -- Custom attribute processing for pyspark.ml params --------------------
+# explicitly enable __init__ docstring for class docstring in API docs
+autoclass_content = 'both'
 
+# -- Custom attribute processing for pyspark.ml params --------------------
 
 class ParamDocumenter(autodoc.AttributeDocumenter):
 
@@ -354,59 +356,11 @@ class ParamDocumenter(autodoc.AttributeDocumenter):
 
     def add_content(self, more_content, no_docstring=False):
         if type(self.object) == Param:
-            autodoc.ClassLevelDocumenter.add_content(self, more_content, False)
+            autodoc.ClassLevelDocumenter.add_content(self, more_content, no_docstring)
         else:
             autodoc.AttributeDocumenter.add_content(self, more_content, no_docstring)
 
 
-param_modules = ["pyspark.ml.classification", "pyspark.ml.clustering",
-                 "pyspark.ml.evaluation", "pyspark.ml.feature", "pyspark.ml.pipeline",
-                 "pyspark.ml.recommendation", "pyspark.ml.regression", "pyspark.ml.tuning"]
-
-
-def process_docstring(what=None):
-    import importlib
-    from pyspark.ml.classification import LogisticRegressionModel
-    """
-    Return a listener that appends instance-specific default values for params
-    """
-    def process(app, what_, name, obj, options, lines):
-        if what and what_ not in what:
-            return
-        if type(obj) == Param:
-            splits = name.rsplit(".", 2)
-            module = splits[0]
-            classname = splits[1]
-            param_name = splits[2]
-            if module in param_modules:
-                klass = getattr(importlib.import_module(module), classname)
-                # this part is very hacky - if class needs constructor args how do we handle that
-                # these are the only 3 exclusions at this point (!)
-                if "CrossValidatorModel" in classname or "OneVsRestModel" in classname or "TrainValidationSplitModel" in classname:
-                    instance = klass(LogisticRegressionModel())
-                else:
-                    instance = klass()
-                try:
-                    param = instance.getParam(param_name)
-                    if param in instance._defaultParamMap:
-                        default = " (Default: " + str(instance._defaultParamMap[param]) + ")."
-                        # remove one trailing blank line.
-                        if lines and not lines[-1]:
-                            lines.pop(-1)
-                        lines[-1] += default
-                        # make sure there is a blank line at the end
-                        if lines and lines[-1]:
-                            lines.append('')
-                except AttributeError:
-                    return
-                except ValueError:
-                    return
-    return process
-
-
 def setup(app):
-    from pyspark import SparkContext
-    sc = SparkContext("local[1]", "sphinx")
-    app.connect('autodoc-process-docstring', process_docstring(what=['attribute']))
     app.add_autodocumenter(ParamDocumenter)
     return app
