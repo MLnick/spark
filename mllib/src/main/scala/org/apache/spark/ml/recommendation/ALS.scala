@@ -41,6 +41,7 @@ import org.apache.spark.mllib.linalg.CholeskyDecomposition
 import org.apache.spark.mllib.optimization.NNLS
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset}
+import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
@@ -375,16 +376,7 @@ class ALSModel private[ml] (
       .join(srcFactors, dataset(srcCol) === srcFactors("id"), "left")
       .select(srcFactors("id"), srcFactors("features"))
 
-    val topKRaw = ALSModel.recommendForAll(rank, factors, dstFactors, num)
-    val topK = if ($(withScores)) {
-      // with scores, 'predictions' is an Array((id1, score1), (id2, score2), ...)
-      topKRaw.toDF("id", "recommendations")
-    } else {
-      // without scores, 'predictions' is an Array(id1, id2, ...)
-      topKRaw
-        .map { case (id, predsWithScores) => (id, predsWithScores.map(_._1)) }
-        .toDF("id", "recommendations")
-    }
+    val topK = ALSModel.recommendForAll(rank, factors, dstFactors, num)
 
     val result = if (schema.fieldNames.contains(dstCol)) {
       // if 'dstCol' exists, we group by that column to generate the 'ground truth' set of
@@ -393,6 +385,17 @@ class ALSModel private[ml] (
       // (id, predictions, actual) per unique id in 'srcCol', discarding all other columns.
       // In practice this is expected only during model selection with
       // CrossValidator/TrainValidationSplit using RankingEvaluator.
+
+      dataset.join(
+        topK, dataset(srcCol) === topK("srcId") && dataset(dstCol) === topK("dstId"), "full")
+        .select(
+          when(dataset("rating").isNull, topK("srcId"))
+            .otherwise(dataset(srcCol)).alias(srcCol),
+          when(topK("predicted_rating").isNull, dataset(dstCol))
+            .otherwise(topK("dstId")).alias(dstCol),
+          dataset("rating").alias("rating"), topK("predicted_rating").alias($(predictionCol)))
+
+      /*
       val actual = dataset
         .select(srcCol, dstCol)
         .as[(Int, Int)]
@@ -410,14 +413,15 @@ class ALSModel private[ml] (
           topK("recommendations").as($(predictionCol)),
           actual("actual").as($(labelCol))
         )
+        */
     } else {
       // if 'dstCol' doesn't exist, we assume we are passed a DataFrame of unique user (or item) ids
       // for which to make recommendations, and so we don't use distinct here. This preserves the
       // schema and structure of the input DataFrame (but doesn't handle duplicate input ids so will
       // generate recommendations multiple times in this case).
       dataset
-        .join(topK, dataset(srcCol) === topK("id"), "left")
-        .select(dataset("*"), topK("recommendations").as($(predictionCol)))
+        .join(topK, dataset(srcCol) === topK("srcId"), "left")
+        .select(dataset("*"), topK("predicted_rating").as($(predictionCol)))
     }
     result
   }
@@ -539,14 +543,86 @@ object ALSModel extends MLReadable[ALSModel] {
       rank: Int,
       srcFactors: DataFrame,
       dstFactors: DataFrame,
-      num: Int): RDD[(Int, Array[(Int, Float)])] = {
-    import srcFactors.sqlContext.implicits._
-    import org.apache.spark.mllib.recommendation.MatrixFactorizationModel
+      num: Int): DataFrame = {
+    import srcFactors.sparkSession.implicits._
 
-    val srcFactorsRDD = srcFactors.as[(Int, Array[Float])].rdd
-    val dstFactorsRDD = dstFactors.as[(Int, Array[Float])].rdd
-    MatrixFactorizationModel.recommendForAll(rank, srcFactorsRDD, dstFactorsRDD, num)
+    val srcBlocks = blockify(rank, srcFactors.as[(Int, Array[Float])])
+    val dstBlocks = blockify(rank, dstFactors.as[(Int, Array[Float])])
+    val predictions = srcBlocks.crossJoin(dstBlocks)
+      .as[(Array[Int], Array[Float], Array[Int], Array[Float])]
+      .flatMap { case (srcIds, srcFactors, dstIds, dstFactors) =>
+        val m = srcIds.length
+        val n = dstIds.length
+        val targetMatrix = new Array[Float](m * n)
+        val A = srcFactors.asInstanceOf[Array[Float]]
+        val B = dstFactors.asInstanceOf[Array[Float]]
+        val C = targetMatrix.asInstanceOf[Array[Float]]
+        blas.sgemm("T", "N", m, n, rank, 1f, A, rank, B, rank, 0f, C, m)
+        fillPredictions(srcIds, dstIds, targetMatrix, m, n).toSeq
+      }
+
+    val w = Window.partitionBy("srcId").orderBy(desc("predicted_rating"))
+    predictions
+      .withColumnRenamed("_1", "srcId")
+      .withColumnRenamed("_2", "dstId")
+      .withColumnRenamed("_3", "predicted_rating")
+      .withColumn("row_num", row_number().over(w))
+      .where(col("row_num") <= num).drop("row_num")
   }
+
+  /**
+   * Fills array of (srcId, Array[(targetId, score)] from the result of multiplying the
+   * user and item factor matrices.
+   */
+  private def fillPredictions(
+    srcIds: Array[Int],
+    dstIds: Array[Int],
+    predictions: Array[Float],
+    m: Int,
+    n: Int): Array[(Int, Int, Float)] = {
+    val output = new Array[(Int, Int, Float)](m * n)
+    // outer loop over columns
+    var k = 0
+    var j = 0
+    while (j < n) {
+      var i = 0
+      val indStart = j * m
+      while (i < m) {
+        output(k) = (srcIds(i), dstIds(j), predictions(indStart + i))
+        i += 1
+        k += 1
+      }
+      j += 1
+    }
+    output
+  }
+
+  /**
+   * Blockifies features to use Level-3 BLAS.
+   */
+  private def blockify(
+    rank: Int,
+    features: Dataset[(Int, Array[Float])],
+    /* TODO make blockSize a param */blockSize: Int = 4096): Dataset[(Array[Int], Array[Float])] = {
+    import features.sparkSession.implicits._
+    val blockStorage = rank * blockSize
+    features.mapPartitions { iter =>
+      iter.grouped(blockSize).map { grouped =>
+        val ids = mutable.ArrayBuilder.make[Int]
+        ids.sizeHint(blockSize)
+        val factors = mutable.ArrayBuilder.make[Float]
+        factors.sizeHint(blockStorage)
+        var i = 0
+        grouped.foreach { case (id, factor) =>
+          ids += id
+          factors ++= factor
+          i += 1
+        }
+        (ids.result(), factors.result())
+      }
+    }
+  }
+
 }
 
 object ALSModelUtil {
