@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTypes}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.{AggregateEstimation, ProjectEstimation}
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.{AggregateEstimation, EstimationUtils, JoinEstimation, ProjectEstimation}
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
 
@@ -101,10 +101,17 @@ case class Generate(
 
   override def producedAttributes: AttributeSet = AttributeSet(generatorOutput)
 
-  def qualifiedGeneratorOutput: Seq[Attribute] = qualifier.map { q =>
-    // prepend the new qualifier to the existed one
-    generatorOutput.map(a => a.withQualifier(Some(q)))
-  }.getOrElse(generatorOutput)
+  def qualifiedGeneratorOutput: Seq[Attribute] = {
+    val qualifiedOutput = qualifier.map { q =>
+      // prepend the new qualifier to the existed one
+      generatorOutput.map(a => a.withQualifier(Some(q)))
+    }.getOrElse(generatorOutput)
+    val nullableOutput = qualifiedOutput.map {
+      // if outer, make all attributes nullable, otherwise keep existing nullability
+      a => a.withNullability(outer || a.nullable)
+    }
+    nullableOutput
+  }
 
   def output: Seq[Attribute] = {
     if (join) child.output ++ qualifiedGeneratorOutput else qualifiedGeneratorOutput
@@ -333,14 +340,22 @@ case class Join(
     case _ => resolvedExceptNatural
   }
 
-  override def computeStats(conf: CatalystConf): Statistics = joinType match {
-    case LeftAnti | LeftSemi =>
-      // LeftSemi and LeftAnti won't ever be bigger than left
-      left.stats(conf).copy()
-    case _ =>
-      // make sure we don't propagate isBroadcastable in other joins, because
-      // they could explode the size.
-      super.computeStats(conf).copy(isBroadcastable = false)
+  override def computeStats(conf: CatalystConf): Statistics = {
+    def simpleEstimation: Statistics = joinType match {
+      case LeftAnti | LeftSemi =>
+        // LeftSemi and LeftAnti won't ever be bigger than left
+        left.stats(conf)
+      case _ =>
+        // Make sure we don't propagate isBroadcastable in other joins, because
+        // they could explode the size.
+        super.computeStats(conf).copy(isBroadcastable = false)
+    }
+
+    if (conf.cboEnabled) {
+      JoinEstimation.estimate(conf, this).getOrElse(simpleEstimation)
+    } else {
+      simpleEstimation
+    }
   }
 }
 
@@ -356,7 +371,17 @@ case class BroadcastHint(child: LogicalPlan) extends UnaryNode {
 }
 
 /**
- * Insert some data into a table.
+ * A general hint for the child. This node will be eliminated post analysis.
+ * A pair of (name, parameters).
+ */
+case class Hint(name: String, parameters: Seq[String], child: LogicalPlan) extends UnaryNode {
+  override lazy val resolved: Boolean = false
+  override def output: Seq[Attribute] = child.output
+}
+
+/**
+ * Insert some data into a table. Note that this plan is unresolved and has to be replaced by the
+ * concrete implementations during analysis.
  *
  * @param table the logical plan representing the table. In the future this should be a
  *              [[org.apache.spark.sql.catalyst.catalog.CatalogTable]] once we converge Hive tables
@@ -367,25 +392,24 @@ case class BroadcastHint(child: LogicalPlan) extends UnaryNode {
  *                  Map('a' -> Some('1'), 'b' -> Some('2')),
  *                  and `INSERT INTO tbl PARTITION (a=1, b) AS ...`
  *                  would have Map('a' -> Some('1'), 'b' -> None).
- * @param child the logical plan representing data to write to.
+ * @param query the logical plan representing data to write to.
  * @param overwrite overwrite existing table or partitions.
  * @param ifNotExists If true, only write if the table or partition does not exist.
  */
 case class InsertIntoTable(
     table: LogicalPlan,
     partition: Map[String, Option[String]],
-    child: LogicalPlan,
+    query: LogicalPlan,
     overwrite: Boolean,
     ifNotExists: Boolean)
   extends LogicalPlan {
-
-  override def children: Seq[LogicalPlan] = child :: Nil
-  override def output: Seq[Attribute] = Seq.empty
-
   assert(overwrite || !ifNotExists)
   assert(partition.values.forall(_.nonEmpty) || !ifNotExists)
 
-  override lazy val resolved: Boolean = childrenResolved && table.resolved
+  // We don't want `table` in children as sometimes we don't want to transform it.
+  override def children: Seq[LogicalPlan] = query :: Nil
+  override def output: Seq[Attribute] = Seq.empty
+  override lazy val resolved: Boolean = false
 }
 
 /**
@@ -534,7 +558,10 @@ case class Aggregate(
   override def computeStats(conf: CatalystConf): Statistics = {
     def simpleEstimation: Statistics = {
       if (groupingExpressions.isEmpty) {
-        super.computeStats(conf).copy(sizeInBytes = 1)
+        Statistics(
+          sizeInBytes = EstimationUtils.getOutputSize(output, outputRowCount = 1),
+          rowCount = Some(1),
+          isBroadcastable = child.stats(conf).isBroadcastable)
       } else {
         super.computeStats(conf)
       }

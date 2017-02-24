@@ -37,6 +37,7 @@ class SessionCatalogSuite extends PlanTest {
   private val utils = new CatalogTestUtils {
     override val tableInputFormat: String = "com.fruit.eyephone.CameraInputFormat"
     override val tableOutputFormat: String = "com.fruit.eyephone.CameraOutputFormat"
+    override val defaultProvider: String = "parquet"
     override def newEmptyCatalog(): ExternalCatalog = new InMemoryCatalog
   }
 
@@ -436,33 +437,11 @@ class SessionCatalogSuite extends PlanTest {
       == SubqueryAlias("tbl1", SimpleCatalogRelation(metastoreTable1), None))
     // Otherwise, we'll first look up a temporary table with the same name
     assert(sessionCatalog.lookupRelation(TableIdentifier("tbl1"))
-      == SubqueryAlias("tbl1", tempTable1, Some(TableIdentifier("tbl1"))))
+      == SubqueryAlias("tbl1", tempTable1, None))
     // Then, if that does not exist, look up the relation in the current database
     sessionCatalog.dropTable(TableIdentifier("tbl1"), ignoreIfNotExists = false, purge = false)
     assert(sessionCatalog.lookupRelation(TableIdentifier("tbl1"))
       == SubqueryAlias("tbl1", SimpleCatalogRelation(metastoreTable1), None))
-  }
-
-  test("lookup table relation with alias") {
-    val catalog = new SessionCatalog(newBasicCatalog())
-    val alias = "monster"
-    val tableMetadata = catalog.getTableMetadata(TableIdentifier("tbl1", Some("db2")))
-    val relation = SubqueryAlias("tbl1", SimpleCatalogRelation(tableMetadata), None)
-    val relationWithAlias =
-      SubqueryAlias(alias,
-        SimpleCatalogRelation(tableMetadata), None)
-    assert(catalog.lookupRelation(
-      TableIdentifier("tbl1", Some("db2")), alias = None) == relation)
-    assert(catalog.lookupRelation(
-      TableIdentifier("tbl1", Some("db2")), alias = Some(alias)) == relationWithAlias)
-  }
-
-  test("lookup view with view name in alias") {
-    val catalog = new SessionCatalog(newBasicCatalog())
-    val tmpView = Range(1, 10, 2, 10)
-    catalog.createTempView("vw1", tmpView, overrideIfExists = false)
-    val plan = catalog.lookupRelation(TableIdentifier("vw1"), Option("range"))
-    assert(plan == SubqueryAlias("range", tmpView, Option(TableIdentifier("vw1"))))
   }
 
   test("look up view relation") {
@@ -479,7 +458,7 @@ class SessionCatalogSuite extends PlanTest {
     // Look up a view using current database of the session catalog.
     sessionCatalog.setCurrentDatabase("db3")
     comparePlans(sessionCatalog.lookupRelation(TableIdentifier("view1")),
-      SubqueryAlias("view1", view, Some(TableIdentifier("view1"))))
+      SubqueryAlias("view1", view, Some(TableIdentifier("view1", Some("db3")))))
   }
 
   test("table exists") {
@@ -625,6 +604,13 @@ class SessionCatalogSuite extends PlanTest {
     }
     assert(e.getMessage.contains("Partition spec is invalid. The spec (a, unknown) must match " +
       "the partition spec (a, b) defined in table '`db2`.`tbl2`'"))
+    e = intercept[AnalysisException] {
+      catalog.createPartitions(
+        TableIdentifier("tbl2", Some("db2")),
+        Seq(partWithEmptyValue, part1), ignoreIfExists = true)
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec ([a=3, b=]) contains an " +
+      "empty partition column value"))
   }
 
   test("drop partitions") {
@@ -722,6 +708,16 @@ class SessionCatalogSuite extends PlanTest {
     assert(e.getMessage.contains(
       "Partition spec is invalid. The spec (a, unknown) must be contained within " +
         "the partition spec (a, b) defined in table '`db2`.`tbl2`'"))
+    e = intercept[AnalysisException] {
+      catalog.dropPartitions(
+        TableIdentifier("tbl2", Some("db2")),
+        Seq(partWithEmptyValue.spec, part1.spec),
+        ignoreIfNotExists = false,
+        purge = false,
+        retainData = false)
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec ([a=3, b=]) contains an " +
+      "empty partition column value"))
   }
 
   test("get partition") {
@@ -767,6 +763,11 @@ class SessionCatalogSuite extends PlanTest {
     }
     assert(e.getMessage.contains("Partition spec is invalid. The spec (a, unknown) must match " +
       "the partition spec (a, b) defined in table '`db2`.`tbl1`'"))
+    e = intercept[AnalysisException] {
+      catalog.getPartition(TableIdentifier("tbl1", Some("db2")), partWithEmptyValue.spec)
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec ([a=3, b=]) contains an " +
+      "empty partition column value"))
   }
 
   test("rename partitions") {
@@ -834,6 +835,13 @@ class SessionCatalogSuite extends PlanTest {
     }
     assert(e.getMessage.contains("Partition spec is invalid. The spec (a, unknown) must match " +
       "the partition spec (a, b) defined in table '`db2`.`tbl1`'"))
+    e = intercept[AnalysisException] {
+      catalog.renamePartitions(
+        TableIdentifier("tbl1", Some("db2")),
+        Seq(part1.spec), Seq(partWithEmptyValue.spec))
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec ([a=3, b=]) contains an " +
+      "empty partition column value"))
   }
 
   test("alter partitions") {
@@ -893,6 +901,11 @@ class SessionCatalogSuite extends PlanTest {
     }
     assert(e.getMessage.contains("Partition spec is invalid. The spec (a, unknown) must match " +
       "the partition spec (a, b) defined in table '`db2`.`tbl1`'"))
+    e = intercept[AnalysisException] {
+      catalog.alterPartitions(TableIdentifier("tbl1", Some("db2")), Seq(partWithEmptyValue))
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec ([a=3, b=]) contains an " +
+      "empty partition column value"))
   }
 
   test("list partition names") {
@@ -914,10 +927,24 @@ class SessionCatalogSuite extends PlanTest {
 
   test("list partition names with invalid partial partition spec") {
     val catalog = new SessionCatalog(newBasicCatalog())
-    intercept[AnalysisException] {
+    var e = intercept[AnalysisException] {
       catalog.listPartitionNames(TableIdentifier("tbl2", Some("db2")),
-        Some(Map("unknown" -> "unknown")))
+        Some(partWithMoreColumns.spec))
     }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec (a, b, c) must be " +
+      "contained within the partition spec (a, b) defined in table '`db2`.`tbl2`'"))
+    e = intercept[AnalysisException] {
+      catalog.listPartitionNames(TableIdentifier("tbl2", Some("db2")),
+        Some(partWithUnknownColumns.spec))
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec (a, unknown) must be " +
+      "contained within the partition spec (a, b) defined in table '`db2`.`tbl2`'"))
+    e = intercept[AnalysisException] {
+      catalog.listPartitionNames(TableIdentifier("tbl2", Some("db2")),
+        Some(partWithEmptyValue.spec))
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec ([a=3, b=]) contains an " +
+      "empty partition column value"))
   }
 
   test("list partitions") {
@@ -937,10 +964,22 @@ class SessionCatalogSuite extends PlanTest {
 
   test("list partitions with invalid partial partition spec") {
     val catalog = new SessionCatalog(newBasicCatalog())
-    intercept[AnalysisException] {
-      catalog.listPartitions(
-        TableIdentifier("tbl2", Some("db2")), Some(Map("unknown" -> "unknown")))
+    var e = intercept[AnalysisException] {
+      catalog.listPartitions(TableIdentifier("tbl2", Some("db2")), Some(partWithMoreColumns.spec))
     }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec (a, b, c) must be " +
+      "contained within the partition spec (a, b) defined in table '`db2`.`tbl2`'"))
+    e = intercept[AnalysisException] {
+      catalog.listPartitions(TableIdentifier("tbl2", Some("db2")),
+        Some(partWithUnknownColumns.spec))
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec (a, unknown) must be " +
+      "contained within the partition spec (a, b) defined in table '`db2`.`tbl2`'"))
+    e = intercept[AnalysisException] {
+      catalog.listPartitions(TableIdentifier("tbl2", Some("db2")), Some(partWithEmptyValue.spec))
+    }
+    assert(e.getMessage.contains("Partition spec is invalid. The spec ([a=3, b=]) contains an " +
+      "empty partition column value"))
   }
 
   test("list partitions when database/table does not exist") {

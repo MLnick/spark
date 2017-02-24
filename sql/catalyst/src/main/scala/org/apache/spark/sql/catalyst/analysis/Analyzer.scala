@@ -106,7 +106,17 @@ class Analyzer(
    */
   val extendedResolutionRules: Seq[Rule[LogicalPlan]] = Nil
 
+  /**
+   * Override to provide rules to do post-hoc resolution. Note that these rules will be executed
+   * in an individual batch. This batch is to run right after the normal resolution batch and
+   * execute its rules in one pass.
+   */
+  val postHocResolutionRules: Seq[Rule[LogicalPlan]] = Nil
+
   lazy val batches: Seq[Batch] = Seq(
+    Batch("Hints", fixedPoint,
+      new ResolveHints.ResolveBroadcastHints(conf),
+      ResolveHints.RemoveAllHints),
     Batch("Substitution", fixedPoint,
       CTESubstitution,
       WindowsSubstitution,
@@ -139,6 +149,7 @@ class Analyzer(
       ResolveInlineTables ::
       TypeCoercion.typeCoercionRules ++
       extendedResolutionRules : _*),
+    Batch("Post-Hoc Resolution", Once, postHocResolutionRules: _*),
     Batch("View", Once,
       AliasViewChild(conf)),
     Batch("Nondeterministic", Once,
@@ -147,6 +158,8 @@ class Analyzer(
       HandleNullInputsForUDF),
     Batch("FixNullability", Once,
       FixNullability),
+    Batch("ResolveTimeZone", Once,
+      ResolveTimeZone),
     Batch("Cleanup", fixedPoint,
       CleanupAliases)
   )
@@ -167,12 +180,8 @@ class Analyzer(
     def substituteCTE(plan: LogicalPlan, cteRelations: Seq[(String, LogicalPlan)]): LogicalPlan = {
       plan transformDown {
         case u : UnresolvedRelation =>
-          val substituted = cteRelations.find(x => resolver(x._1, u.tableIdentifier.table))
-            .map(_._2).map { relation =>
-              val withAlias = u.alias.map(SubqueryAlias(_, relation, None))
-              withAlias.getOrElse(relation)
-            }
-          substituted.getOrElse(u)
+          cteRelations.find(x => resolver(x._1, u.tableIdentifier.table))
+            .map(_._2).getOrElse(u)
         case other =>
           // This cannot be done in ResolveSubquery because ResolveSubquery does not know the CTE.
           other transformExpressions {
@@ -215,7 +224,7 @@ class Analyzer(
               case ne: NamedExpression => ne
               case e if !e.resolved => u
               case g: Generator => MultiAlias(g, Nil)
-              case c @ Cast(ne: NamedExpression, _) => Alias(c, ne.name)()
+              case c @ Cast(ne: NamedExpression, _, _) => Alias(c, ne.name)()
               case e: ExtractValue => Alias(e, toPrettySQL(e))()
               case e if optGenAliasFunc.isDefined =>
                 Alias(child, optGenAliasFunc.get.apply(e))()
@@ -477,7 +486,7 @@ class Analyzer(
           } else {
             val suffix = aggregate match {
               case n: NamedExpression => n.name
-              case _ => aggregate.sql
+              case _ => toPrettySQL(aggregate)
             }
             value + "_" + suffix
           }
@@ -565,9 +574,9 @@ class Analyzer(
     //     |- view2 (defaultDatabase = db2)
     //        |- view3 (defaultDatabase = db3)
     //   |- view4 (defaultDatabase = db4)
-    // In this case, the view `view1` is a nested view, it directly references `table2`、`view2`
+    // In this case, the view `view1` is a nested view, it directly references `table2`, `view2`
     // and `view4`, the view `view2` references `view3`. On resolving the table, we look up the
-    // relations `table2`、`view2`、`view4` using the default database `db1`, and look up the
+    // relations `table2`, `view2`, `view4` using the default database `db1`, and look up the
     // relation `view3` using the default database `db2`.
     //
     // Note this is compatible with the views defined by older versions of Spark(before 2.2), which
@@ -607,13 +616,18 @@ class Analyzer(
     private def lookupTableFromCatalog(
         u: UnresolvedRelation,
         defaultDatabase: Option[String] = None): LogicalPlan = {
+      val tableIdentWithDb = u.tableIdentifier.copy(
+        database = u.tableIdentifier.database.orElse(defaultDatabase))
       try {
-        val tableIdentWithDb = u.tableIdentifier.copy(
-          database = u.tableIdentifier.database.orElse(defaultDatabase))
-        catalog.lookupRelation(tableIdentWithDb, u.alias)
+        catalog.lookupRelation(tableIdentWithDb)
       } catch {
         case _: NoSuchTableException =>
-          u.failAnalysis(s"Table or view not found: ${u.tableName}")
+          u.failAnalysis(s"Table or view not found: ${tableIdentWithDb.unquotedString}")
+        // If the database is defined and that database is not found, throw an AnalysisException.
+        // Note that if the database is not defined, it is possible we are looking up a temp view.
+        case e: NoSuchDatabaseException =>
+          u.failAnalysis(s"Table or view not found: ${tableIdentWithDb.unquotedString}, the " +
+            s"database ${e.db} doesn't exsits.")
       }
     }
 
@@ -1619,11 +1633,18 @@ class Analyzer(
       case _ => expr
     }
 
-    /** Extracts a [[Generator]] expression and any names assigned by aliases to their output. */
     private object AliasedGenerator {
-      def unapply(e: Expression): Option[(Generator, Seq[String])] = e match {
-        case Alias(g: Generator, name) if g.resolved => Some((g, name :: Nil))
-        case MultiAlias(g: Generator, names) if g.resolved => Some(g, names)
+      /**
+       * Extracts a [[Generator]] expression, any names assigned by aliases to the outputs
+       * and the outer flag. The outer flag is used when joining the generator output.
+       * @param e the [[Expression]]
+       * @return (the [[Generator]], seq of output names, outer flag)
+       */
+      def unapply(e: Expression): Option[(Generator, Seq[String], Boolean)] = e match {
+        case Alias(GeneratorOuter(g: Generator), name) if g.resolved => Some((g, name :: Nil, true))
+        case MultiAlias(GeneratorOuter(g: Generator), names) if g.resolved => Some(g, names, true)
+        case Alias(g: Generator, name) if g.resolved => Some((g, name :: Nil, false))
+        case MultiAlias(g: Generator, names) if g.resolved => Some(g, names, false)
         case _ => None
       }
     }
@@ -1644,7 +1665,8 @@ class Analyzer(
         var resolvedGenerator: Generate = null
 
         val newProjectList = projectList.flatMap {
-          case AliasedGenerator(generator, names) if generator.childrenResolved =>
+
+          case AliasedGenerator(generator, names, outer) if generator.childrenResolved =>
             // It's a sanity check, this should not happen as the previous case will throw
             // exception earlier.
             assert(resolvedGenerator == null, "More than one generator found in SELECT.")
@@ -1653,7 +1675,7 @@ class Analyzer(
               Generate(
                 generator,
                 join = projectList.size > 1, // Only join if there are other expressions in SELECT.
-                outer = false,
+                outer = outer,
                 qualifier = None,
                 generatorOutput = ResolveGenerate.makeGeneratorOutput(generator, names),
                 child)
@@ -2008,27 +2030,36 @@ class Analyzer(
       case p: Project => p
       case f: Filter => f
 
+      case a: Aggregate if a.groupingExpressions.exists(!_.deterministic) =>
+        val nondeterToAttr = getNondeterToAttr(a.groupingExpressions)
+        val newChild = Project(a.child.output ++ nondeterToAttr.values, a.child)
+        a.transformExpressions { case e =>
+          nondeterToAttr.get(e).map(_.toAttribute).getOrElse(e)
+        }.copy(child = newChild)
+
       // todo: It's hard to write a general rule to pull out nondeterministic expressions
       // from LogicalPlan, currently we only do it for UnaryNode which has same output
       // schema with its child.
       case p: UnaryNode if p.output == p.child.output && p.expressions.exists(!_.deterministic) =>
-        val nondeterministicExprs = p.expressions.filterNot(_.deterministic).flatMap { expr =>
-          val leafNondeterministic = expr.collect {
-            case n: Nondeterministic => n
-          }
-          leafNondeterministic.map { e =>
-            val ne = e match {
-              case n: NamedExpression => n
-              case _ => Alias(e, "_nondeterministic")(isGenerated = true)
-            }
-            new TreeNodeRef(e) -> ne
-          }
-        }.toMap
+        val nondeterToAttr = getNondeterToAttr(p.expressions)
         val newPlan = p.transformExpressions { case e =>
-          nondeterministicExprs.get(new TreeNodeRef(e)).map(_.toAttribute).getOrElse(e)
+          nondeterToAttr.get(e).map(_.toAttribute).getOrElse(e)
         }
-        val newChild = Project(p.child.output ++ nondeterministicExprs.values, p.child)
+        val newChild = Project(p.child.output ++ nondeterToAttr.values, p.child)
         Project(p.output, newPlan.withNewChildren(newChild :: Nil))
+    }
+
+    private def getNondeterToAttr(exprs: Seq[Expression]): Map[Expression, NamedExpression] = {
+      exprs.filterNot(_.deterministic).flatMap { expr =>
+        val leafNondeterministic = expr.collect { case n: Nondeterministic => n }
+        leafNondeterministic.distinct.map { e =>
+          val ne = e match {
+            case n: NamedExpression => n
+            case _ => Alias(e, "_nondeterministic")(isGenerated = true)
+          }
+          e -> ne
+        }
+      }.toMap
     }
   }
 
@@ -2044,7 +2075,7 @@ class Analyzer(
 
       case p => p transformExpressionsUp {
 
-        case udf @ ScalaUDF(func, _, inputs, _) =>
+        case udf @ ScalaUDF(func, _, inputs, _, _) =>
           val parameterTypes = ScalaReflection.getParameterTypes(func)
           assert(parameterTypes.length == inputs.length)
 
@@ -2272,12 +2303,6 @@ class Analyzer(
         "type of the field in the target object")
     }
 
-    private def illegalNumericPrecedence(from: DataType, to: DataType): Boolean = {
-      val fromPrecedence = TypeCoercion.numericPrecedence.indexOf(from)
-      val toPrecedence = TypeCoercion.numericPrecedence.indexOf(to)
-      toPrecedence > 0 && fromPrecedence > toPrecedence
-    }
-
     def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
       case p if !p.childrenResolved => p
       case p if p.resolved => p
@@ -2285,20 +2310,24 @@ class Analyzer(
       case p => p transformExpressions {
         case u @ UpCast(child, _, _) if !child.resolved => u
 
-        case UpCast(child, dataType, walkedTypePath) => (child.dataType, dataType) match {
-          case (from: NumericType, to: DecimalType) if !to.isWiderThan(from) =>
-            fail(child, to, walkedTypePath)
-          case (from: DecimalType, to: NumericType) if !from.isTighterThan(to) =>
-            fail(child, to, walkedTypePath)
-          case (from, to) if illegalNumericPrecedence(from, to) =>
-            fail(child, to, walkedTypePath)
-          case (TimestampType, DateType) =>
-            fail(child, DateType, walkedTypePath)
-          case (StringType, to: NumericType) =>
-            fail(child, to, walkedTypePath)
-          case _ => Cast(child, dataType.asNullable)
-        }
+        case UpCast(child, dataType, walkedTypePath)
+          if Cast.mayTruncate(child.dataType, dataType) =>
+          fail(child, dataType, walkedTypePath)
+
+        case UpCast(child, dataType, walkedTypePath) => Cast(child, dataType.asNullable)
       }
+    }
+  }
+
+  /**
+   * Replace [[TimeZoneAwareExpression]] without [[TimeZone]] by its copy with session local
+   * time zone.
+   */
+  object ResolveTimeZone extends Rule[LogicalPlan] {
+
+    override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveExpressions {
+      case e: TimeZoneAwareExpression if e.timeZoneId.isEmpty =>
+        e.withTimeZone(conf.sessionLocalTimeZone)
     }
   }
 }

@@ -431,7 +431,7 @@ private[hive] class TestHiveSparkSession(
       sharedState.cacheManager.clearCache()
       loadedTables.clear()
       sessionState.catalog.clearTempTables()
-      sessionState.catalog.invalidateCache()
+      sessionState.catalog.tableRelationCache.invalidateAll()
 
       sessionState.metadataHive.reset()
 
@@ -483,7 +483,7 @@ private[hive] class TestHiveQueryExecution(
     // Make sure any test tables referenced are loaded.
     val referencedTables =
       describedTables ++
-        logical.collect { case UnresolvedRelation(tableIdent, _) => tableIdent.table }
+        logical.collect { case UnresolvedRelation(tableIdent) => tableIdent.table }
     val referencedTestTables = referencedTables.filter(sparkSession.testTables.contains)
     logDebug(s"Query references test tables: ${referencedTestTables.mkString(", ")}")
     referencedTestTables.foreach(sparkSession.loadTestTable)
