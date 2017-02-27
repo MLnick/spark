@@ -35,6 +35,7 @@ import org.apache.spark.SparkContext
 import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.{JavaPairRDD, JavaRDD}
 import org.apache.spark.internal.Logging
+import org.apache.spark.ml.linalg.DenseMatrix
 import org.apache.spark.mllib.rdd.MLPairRDDFunctions._
 import org.apache.spark.mllib.util.{Loader, Saveable}
 import org.apache.spark.rdd.RDD
@@ -274,7 +275,7 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       rank: Int,
       srcFactors: RDD[(Int, Array[T])],
       dstFactors: RDD[(Int, Array[T])],
-      num: Int): RDD[(Int, Array[(Int, T)])] = {
+      num: Int): RDD[(Int, Array[(Int, Float)])] = {
     val srcBlocks = blockify(rank, srcFactors)
     val dstBlocks = blockify(rank, dstFactors)
     val tag = implicitly[ClassTag[T]].runtimeClass
@@ -282,20 +283,23 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       case ((srcIds, srcFactors), (dstIds, dstFactors)) =>
         val m = srcIds.length
         val n = dstIds.length
-        val targetMatrix = new Array[T](m * n)
-        tag match {
+        val k = math.min(n, num)
+        val targetArray = new Array[T](m * n)
+        val targetMatrix = tag match {
           case java.lang.Float.TYPE =>
             val A = srcFactors.asInstanceOf[Array[Float]]
             val B = dstFactors.asInstanceOf[Array[Float]]
-            val C = targetMatrix.asInstanceOf[Array[Float]]
+            val C = targetArray.asInstanceOf[Array[Float]]
             blas.sgemm("T", "N", m, n, rank, 1f, A, rank, B, rank, 0f, C, m)
+            new DenseMatrix(m, n, C.map(_.toDouble))
           case java.lang.Double.TYPE =>
             val A = srcFactors.asInstanceOf[Array[Double]]
             val B = dstFactors.asInstanceOf[Array[Double]]
-            val C = targetMatrix.asInstanceOf[Array[Double]]
+            val C = targetArray.asInstanceOf[Array[Double]]
             blas.dgemm("T", "N", m, n, rank, 1f, A, rank, B, rank, 0f, C, m)
+            new DenseMatrix(m, n, C)
         }
-        fillPredictions(srcIds, dstIds, targetMatrix, m, n).toSeq
+        fillPredictions(srcIds, dstIds, targetMatrix, m, k).toSeq
     }
     ratings.topByKey(num)(Ordering.by(_._2))
   }
@@ -304,25 +308,22 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
    * Fills array of (srcId, Array[(targetId, score)] from the result of multiplying the
    * user and item factor matrices.
    */
-  private def fillPredictions[T : ClassTag](
+  private def fillPredictions(
       srcIds: Array[Int],
       dstIds: Array[Int],
-      predictions: Array[T],
+      predictions: DenseMatrix,
       m: Int,
-      n: Int): Array[(Int, (Int, T))] = {
-    val output = new Array[(Int, (Int, T))](m * n)
-    // outer loop over columns
-    var k = 0
+      num: Int): Array[(Int, (Int, Float))] = {
+    val output = new Array[(Int, (Int, Float))](m * num)
+    var i = 0
     var j = 0
-    while (j < n) {
-      var i = 0
-      val indStart = j * m
-      while (i < m) {
-        output(k) = (srcIds(i), (dstIds(j), predictions(indStart + i)))
-        i += 1
-        k += 1
+    predictions.rowIter.foreach { case vec =>
+      val topKWithIdx = vec.toArray.zipWithIndex.sortBy(-_._1).take(num)
+      topKWithIdx.foreach { case (value, dstIdx) =>
+        output(j) = (srcIds(i), (dstIds(dstIdx), value.toFloat))
+        j += 1
       }
-      j += 1
+      i += 1
     }
     output
   }
