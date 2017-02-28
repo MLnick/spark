@@ -34,6 +34,7 @@ import org.apache.spark.{Dependency, Partitioner, ShuffleDependency, SparkContex
 import org.apache.spark.annotation.{DeveloperApi, Since}
 import org.apache.spark.internal.Logging
 import org.apache.spark.ml.{Estimator, Model}
+import org.apache.spark.ml.linalg.DenseMatrix
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
@@ -371,12 +372,14 @@ object ALSModel extends MLReadable[ALSModel] {
       .flatMap { case (srcIds, srcFactors, dstIds, dstFactors) =>
         val m = srcIds.length
         val n = dstIds.length
+        val k = math.min(n, num)
         val targetMatrix = new Array[Float](m * n)
         val A = srcFactors.asInstanceOf[Array[Float]]
         val B = dstFactors.asInstanceOf[Array[Float]]
         val C = targetMatrix.asInstanceOf[Array[Float]]
         blas.sgemm("T", "N", m, n, rank, 1f, A, rank, B, rank, 0f, C, m)
-        fillPredictions(srcIds, dstIds, targetMatrix, m, n).toSeq
+        val dm = new DenseMatrix(m, n, C.map(_.toDouble))
+        fillPredictions(srcIds, dstIds, dm, m, k).toSeq
       }
     predictions
   }
@@ -414,22 +417,19 @@ object ALSModel extends MLReadable[ALSModel] {
   private def fillPredictions(
     srcIds: Array[Int],
     dstIds: Array[Int],
-    predictions: Array[Float],
+    predictions: DenseMatrix,
     m: Int,
-    n: Int): Array[(Int, Int, Float)] = {
-    val output = new Array[(Int, Int, Float)](m * n)
-    // outer loop over columns
-    var k = 0
+    num: Int): Array[(Int, Int, Float)] = {
+    val output = new Array[(Int, Int, Float)](m * num)
+    var i = 0
     var j = 0
-    while (j < n) {
-      var i = 0
-      val indStart = j * m
-      while (i < m) {
-        output(k) = (srcIds(i), dstIds(j), predictions(indStart + i))
-        i += 1
-        k += 1
+    predictions.rowIter.foreach { case vec =>
+      val topKWithIdx = vec.toArray.zipWithIndex.sortBy(-_._1).take(num)
+      topKWithIdx.foreach { case (value, dstIdx) =>
+        output(j) = (srcIds(i), dstIds(dstIdx), value.toFloat)
+        j += 1
       }
-      j += 1
+      i += 1
     }
     output
   }
