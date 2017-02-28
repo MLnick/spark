@@ -329,20 +329,110 @@ class ALSModel private[ml] (
       num: Int): DataFrame = {
     import srcFactors.sparkSession.implicits._
 
+    /*
     val ratings = srcFactors.crossJoin(dstFactors)
       .select(
         srcFactors("id"),
         dstFactors("id"),
         predict(srcFactors("features"), dstFactors("features")))
+    */
+    val ratings = ALSModel.recommendForAll(rank, srcFactors, dstFactors, num)
     // We'll force the IDs to be Int. Unfortunately this converts IDs to Int in the output.
     val topKAggregator = new TopByKeyAggregator[Int, Int, Float](num, Ordering.by(_._2))
-    ratings.as[(Int, Int, Float)].groupByKey(_._1).agg(topKAggregator.toColumn)
+    ratings.groupByKey(_._1).agg(topKAggregator.toColumn)
       .toDF(srcOutputColumn, "recommendations")
   }
 }
 
 @Since("1.6.0")
 object ALSModel extends MLReadable[ALSModel] {
+
+  /**
+   * Makes recommendations for all users (or items).
+   *
+   * @param rank rank the dimension of the factor vectors
+   * @param srcFactors src factor to receive recommendations
+   * @param dstFactors dst factor used to make recommendations
+   * @param num number of recommendations for each user (or item)
+   * @return an RDD of (srcId, recommendations) pairs, where recommendations are stored as an array
+   *         of (dstId, score) pairs.
+   */
+  private def recommendForAll(
+    rank: Int,
+    srcFactors: DataFrame,
+    dstFactors: DataFrame,
+    num: Int): Dataset[(Int, Int, Float)] = {
+    import srcFactors.sparkSession.implicits._
+
+    val srcBlocks = blockify(rank, srcFactors.as[(Int, Array[Float])])
+    val dstBlocks = blockify(rank, dstFactors.as[(Int, Array[Float])])
+    val predictions = srcBlocks.crossJoin(dstBlocks)
+      .as[(Array[Int], Array[Float], Array[Int], Array[Float])]
+      .flatMap { case (srcIds, srcFactors, dstIds, dstFactors) =>
+        val m = srcIds.length
+        val n = dstIds.length
+        val targetMatrix = new Array[Float](m * n)
+        val A = srcFactors.asInstanceOf[Array[Float]]
+        val B = dstFactors.asInstanceOf[Array[Float]]
+        val C = targetMatrix.asInstanceOf[Array[Float]]
+        blas.sgemm("T", "N", m, n, rank, 1f, A, rank, B, rank, 0f, C, m)
+        fillPredictions(srcIds, dstIds, targetMatrix, m, n).toSeq
+      }
+    predictions
+  }
+
+  /**
+   * Blockifies features to use Level-3 BLAS.
+   */
+  private def blockify(
+    rank: Int,
+    features: Dataset[(Int, Array[Float])],
+    /* TODO make blockSize a param */blockSize: Int = 4096): Dataset[(Array[Int], Array[Float])] = {
+    import features.sparkSession.implicits._
+    val blockStorage = rank * blockSize
+    features.mapPartitions { iter =>
+      iter.grouped(blockSize).map { grouped =>
+        val ids = mutable.ArrayBuilder.make[Int]
+        ids.sizeHint(blockSize)
+        val factors = mutable.ArrayBuilder.make[Float]
+        factors.sizeHint(blockStorage)
+        var i = 0
+        grouped.foreach { case (id, factor) =>
+          ids += id
+          factors ++= factor
+          i += 1
+        }
+        (ids.result(), factors.result())
+      }
+    }
+  }
+
+  /**
+   * Fills array of (srcId, Array[(targetId, score)] from the result of multiplying the
+   * user and item factor matrices.
+   */
+  private def fillPredictions(
+    srcIds: Array[Int],
+    dstIds: Array[Int],
+    predictions: Array[Float],
+    m: Int,
+    n: Int): Array[(Int, Int, Float)] = {
+    val output = new Array[(Int, Int, Float)](m * n)
+    // outer loop over columns
+    var k = 0
+    var j = 0
+    while (j < n) {
+      var i = 0
+      val indStart = j * m
+      while (i < m) {
+        output(k) = (srcIds(i), dstIds(j), predictions(indStart + i))
+        i += 1
+        k += 1
+      }
+      j += 1
+    }
+    output
+  }
 
   @Since("1.6.0")
   override def read: MLReader[ALSModel] = new ALSModelReader
