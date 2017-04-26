@@ -294,6 +294,7 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
           output(j + i) = (srcId, (id, score))
           i += 1
         }
+        j += n
       }
       output.toSeq
     }
