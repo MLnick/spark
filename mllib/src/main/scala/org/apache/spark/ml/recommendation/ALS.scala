@@ -380,31 +380,20 @@ class ALSModel private[ml] (
       .flatMap { case (users, items) =>
         val m = users.size
         val n = math.min(items.size, num)
-        val output = new Array[(Int, Int, Float)](m * n)
+        // val output = new Array[(Int, Int, Float)](m * n)
         var j = 0
         def ordering = Ordering.by[(Int, Float), Float](_._2)
-        users.foreach { case (srcId, srcFactor) =>
+        users.flatMap { case (srcId, srcFactor) =>
           val pq = new BoundedPriorityQueue[(Int, Float)](num)(ordering)
           items.foreach { case (dstId, dstFactor) =>
             val score = blas.sdot(rank, srcFactor, 1, dstFactor, 1)
             pq += { (dstId, score) }
           }
-          var i = 0
-          pq.toArray.sorted(ordering.reverse).foreach { case (id, score) =>
-            output(j + i) = (srcId, id, score)
-            i += 1
+          pq.toSeq.sorted(ordering.reverse).map { case (id, score) =>
+            (srcId, id, score)
           }
-          j += n
         }
-        output.toSeq
       }
-    /*
-    val ratings = srcFactors.crossJoin(dstFactors)
-      .select(
-        srcFactors("id"),
-        dstFactors("id"),
-        predict(srcFactors("features"), dstFactors("features"))
-        */
     // We'll force the IDs to be Int. Unfortunately this converts IDs to Int in the output.
     val topKAggregator = new TopByKeyAggregator[Int, Int, Float](num, Ordering.by(_._2))
     val recs = ratings.as[(Int, Int, Float)].groupByKey(_._1).agg(topKAggregator.toColumn)
