@@ -22,6 +22,7 @@ import java.io.IOException
 import java.util.Locale
 
 import scala.collection.mutable
+import scala.collection.mutable.PriorityQueue
 import scala.reflect.ClassTag
 import scala.util.{Sorting, Try}
 import scala.util.hashing.byteswap64
@@ -45,7 +46,7 @@ import org.apache.spark.sql.{DataFrame, Dataset}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{BoundedPriorityQueue, Utils}
 import org.apache.spark.util.collection.{OpenHashMap, OpenHashSet, SortDataFormat, Sorter}
 import org.apache.spark.util.random.XORShiftRandom
 
@@ -372,11 +373,38 @@ class ALSModel private[ml] (
       num: Int): DataFrame = {
     import srcFactors.sparkSession.implicits._
 
+    val srcFactorsBlocked = blockify(srcFactors.as[(Int, Array[Float])])
+    val dstFactorsBlocked = blockify(dstFactors.as[(Int, Array[Float])])
+    val ratings = srcFactorsBlocked.crossJoin(dstFactorsBlocked)
+      .as[(Seq[(Int, Array[Float])], Seq[(Int, Array[Float])])]
+      .flatMap { case (users, items) =>
+        val m = users.size
+        val n = math.min(items.size, num)
+        val output = new Array[(Int, Int, Float)](m * n)
+        var j = 0
+        def ordering = Ordering.by[(Int, Float), Float](_._2)
+        users.foreach { case (srcId, srcFactor) =>
+          val pq = new BoundedPriorityQueue[(Int, Float)](num)(ordering)
+          items.foreach { case (dstId, dstFactor) =>
+            val score = blas.sdot(rank, srcFactor, 1, dstFactor, 1)
+            pq += { (dstId, score) }
+          }
+          var i = 0
+          pq.toArray.sorted(ordering.reverse).foreach { case (id, score) =>
+            output(j + i) = (srcId, id, score)
+            i += 1
+          }
+          j += n
+        }
+        output.toSeq
+      }
+    /*
     val ratings = srcFactors.crossJoin(dstFactors)
       .select(
         srcFactors("id"),
         dstFactors("id"),
-        predict(srcFactors("features"), dstFactors("features")))
+        predict(srcFactors("features"), dstFactors("features"))
+        */
     // We'll force the IDs to be Int. Unfortunately this converts IDs to Int in the output.
     val topKAggregator = new TopByKeyAggregator[Int, Int, Float](num, Ordering.by(_._2))
     val recs = ratings.as[(Int, Int, Float)].groupByKey(_._1).agg(topKAggregator.toColumn)
@@ -389,6 +417,17 @@ class ALSModel private[ml] (
     )
     recs.select($"id" as srcOutputColumn, $"recommendations" cast arrayType)
   }
+
+  /**
+   * Blockifies features
+   */
+  private def blockify(
+    features: Dataset[(Int, Array[Float])],
+    /* TODO make blockSize a param? */blockSize: Int = 4096): Dataset[Seq[(Int, Array[Float])]] = {
+    import features.sparkSession.implicits._
+    features.mapPartitions { iter => iter.grouped(blockSize) }
+  }
+
 }
 
 @Since("1.6.0")
