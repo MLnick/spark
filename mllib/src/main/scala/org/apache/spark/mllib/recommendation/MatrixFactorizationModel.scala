@@ -21,6 +21,7 @@ import com.clearspring.analytics.stream.cardinality.HyperLogLogPlus
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
 import java.io.IOException
 import java.lang.{Integer => JavaInteger}
+
 import org.apache.hadoop.fs.Path
 import org.json4s._
 import org.json4s.JsonDSL._
@@ -38,6 +39,7 @@ import org.apache.spark.mllib.util.{Loader, Saveable}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.util.BoundedPriorityQueue
 
 /**
  * Model representing the result of matrix factorization.
@@ -275,23 +277,24 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       num: Int): RDD[(Int, Array[(Int, Double)])] = {
     val srcBlocks = blockify(rank, srcFeatures)
     val dstBlocks = blockify(rank, dstFeatures)
-    val ratings = srcBlocks.cartesian(dstBlocks).flatMap {
-      case (users, items) =>
+    val ratings = srcBlocks.cartesian(dstBlocks).flatMap { case (users, items) =>
+      def ordering = Ordering.by[(Int, Double), Double](_._2)
       val m = users.size
       val n = math.min(items.size, num)
       val output = new Array[(Int, (Int, Double))](m * n)
       var j = 0
-      users.foreach (user => {
-          def order(a: (Int, Double)) = a._2
-          val pq: PriorityQueue[(Int, Double)] = PriorityQueue()(Ordering.by(order))
-          items.foreach (item => {
-              val rate = blas.ddot(rank, user._2, 1, item._2, 1)
-              pq.enqueue((item._1, rate))
-            })
-          for(i <- 0 to n-1)
-            output(j + i) = (user._1, pq.dequeue())
-          j += n
-      })
+      users.foreach { case (srcId, srcFactor) =>
+        val pq = new BoundedPriorityQueue[(Int, Double)](num)(ordering)
+        items.foreach { case (dstId, dstFactor) =>
+          val score = blas.ddot(rank, srcFactor, 1, dstFactor, 1)
+          pq += { (dstId, score) }
+        }
+        var i = 0
+        pq.toSeq.sorted(ordering.reverse).foreach { case (id, score) =>
+          output(j + i) = (srcId, (id, score))
+          i += 1
+        }
+      }
       output.toSeq
     }
     ratings.topByKey(num)(Ordering.by(_._2))
