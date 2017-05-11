@@ -32,6 +32,7 @@ import org.apache.spark.SparkContext
 import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.{JavaPairRDD, JavaRDD}
 import org.apache.spark.internal.Logging
+import org.apache.spark.mllib.linalg.BLAS
 import org.apache.spark.mllib.rdd.MLPairRDDFunctions._
 import org.apache.spark.mllib.util.{Loader, Saveable}
 import org.apache.spark.rdd.RDD
@@ -246,8 +247,6 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
 
   import org.apache.spark.mllib.util.Loader._
 
-  @transient private[recommendation] val _f2jBLAS = new F2jBLAS
-
   /**
    * Makes recommendations for a single user (or product).
    */
@@ -299,7 +298,7 @@ object MatrixFactorizationModel extends Loader[MatrixFactorizationModel] {
       srcIter.foreach { case (srcId, srcFactor) =>
         dstIter.foreach { case (dstId, dstFactor) =>
           // We use F2jBLAS which is faster than a call to native BLAS for vector dot product
-          val score = _f2jBLAS.ddot(rank, srcFactor, 1, dstFactor, 1)
+          val score = BLAS.f2jBLAS.ddot(rank, srcFactor, 1, dstFactor, 1)
           pq += dstId -> score
         }
         pq.foreach { case (dstId, score) =>
