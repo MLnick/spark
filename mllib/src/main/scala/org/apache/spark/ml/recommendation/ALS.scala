@@ -270,6 +270,14 @@ class ALSModel private[ml] (
     @transient val itemFactors: DataFrame)
   extends Model[ALSModel] with ALSModelParams with MLWritable {
 
+  @transient private lazy val itemFactorsNormed: DataFrame = {
+    itemFactors.select(itemFactors("id"), normScale(itemFactors("features")))
+  }
+
+  @transient private lazy val userFactorsNormed: DataFrame = {
+    userFactors.select(userFactors("id"), normScale(userFactors("features")))
+  }
+
   /** @group setParam */
   @Since("1.4.0")
   def setUserCol(value: String): this.type = set(userCol, value)
@@ -294,6 +302,13 @@ class ALSModel private[ml] (
     } else {
       Float.NaN
     }
+  }
+
+  private val normScale = udf { factor: Seq[Float] =>
+    val fa = factor.toArray
+    val norm = blas.snrm2(rank, fa, 1)
+    blas.sscal(rank, 1 / norm, fa, 1)
+    fa
   }
 
   @Since("2.0.0")
@@ -355,6 +370,30 @@ class ALSModel private[ml] (
   }
 
   /**
+   * Returns top `numItems` items that are most similar to each item, for all items.
+   * Cosine similarity is used as the similarity measure.
+   * @param numItems max number of similar items for each item
+   * @return a DataFrame of (itemCol: Int, recommendations), where recommendations are
+   *         stored as an array of (itemCol: Int, rating: Float) Rows.
+   */
+  @Since("2.3.0")
+  def similarItems(numItems: Int): DataFrame = {
+    recommendForAll(itemFactorsNormed, itemFactorsNormed, $(itemCol), $(itemCol), numItems)
+  }
+
+  /**
+   * Returns top `numUsers` users that are most similar to each user, for all users.
+   * Cosine similarity is used as the similarity measure.
+   * @param numUsers max number of similar users for each user
+   * @return a DataFrame of (userCol: Int, recommendations), where recommendations are
+   *         stored as an array of (userCol: Int, rating: Float) Rows.
+   */
+  @Since("2.3.0")
+  def similarUsers(numUsers: Int): DataFrame = {
+    recommendForAll(userFactorsNormed, userFactorsNormed, $(userCol), $(userCol), numUsers)
+  }
+
+  /**
    * Makes recommendations for all users (or items).
    *
    * Note: the previous approach used for computing top-k recommendations
@@ -385,42 +424,47 @@ class ALSModel private[ml] (
       num: Int): DataFrame = {
     import srcFactors.sparkSession.implicits._
 
-    val srcFactorsBlocked = blockify(srcFactors.as[(Int, Array[Float])])
-    val dstFactorsBlocked = blockify(dstFactors.as[(Int, Array[Float])])
+    val recommendingSimilar = srcOutputColumn == dstOutputColumn
+
+    val (srcFactorsBlocked, dstFactorsBlocked) = if (recommendingSimilar) {
+      val blockedFactors = blockify(srcFactors.as[(Int, Array[Float])])
+      (blockedFactors, blockedFactors)
+    } else {
+      (blockify(srcFactors.as[(Int, Array[Float])]), blockify(dstFactors.as[(Int, Array[Float])]))
+    }
     val ratings = srcFactorsBlocked.crossJoin(dstFactorsBlocked)
       .as[(Seq[(Int, Array[Float])], Seq[(Int, Array[Float])])]
       .flatMap { case (srcIter, dstIter) =>
         val m = srcIter.size
         val n = math.min(dstIter.size, num)
         val output = new Array[(Int, Int, Float)](m * n)
-        var j = 0
+        var i = 0
         val pq = new BoundedPriorityQueue[(Int, Float)](num)(Ordering.by(_._2))
         srcIter.foreach { case (srcId, srcFactor) =>
           dstIter.foreach { case (dstId, dstFactor) =>
-            /*
-             * The below code is equivalent to
-             *    `val score = blas.sdot(rank, srcFactor, 1, dstFactor, 1)`
-             * This handwritten version is as or more efficient as BLAS calls in this case.
-             */
-            var score = 0.0f
-            var k = 0
-            while (k < rank) {
-              score += srcFactor(k) * dstFactor(k)
-              k += 1
+            if (recommendingSimilar && srcId != dstId) {
+              /*
+               * The below code is equivalent to
+               *    `val score = blas.sdot(rank, srcFactor, 1, dstFactor, 1)`
+               * This handwritten version is as or more efficient as BLAS calls in this case.
+               */
+              var score = 0.0f
+              var k = 0
+              while (k < rank) {
+                score += srcFactor(k) * dstFactor(k)
+                k += 1
+              }
+              pq += dstId -> score
             }
-            pq += dstId -> score
           }
-          val pqIter = pq.iterator
-          var i = 0
-          while (i < n) {
-            val (dstId, score) = pqIter.next()
-            output(j + i) = (srcId, dstId, score)
+          pq.foreach { case (dstId, score) =>
+            output(i) = (srcId, dstId, score)
             i += 1
           }
-          j += n
           pq.clear()
         }
-        output.toSeq
+        // we may have null entries for similar recommendations since we skip computation for self
+        output.map(Option(_)).flatten.toSeq
       }
     // We'll force the IDs to be Int. Unfortunately this converts IDs to Int in the output.
     val topKAggregator = new TopByKeyAggregator[Int, Int, Float](num, Ordering.by(_._2))

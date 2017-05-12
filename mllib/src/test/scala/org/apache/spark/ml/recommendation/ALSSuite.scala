@@ -712,6 +712,45 @@ class ALSSuite
     }
   }
 
+  test("similarUsers with k <, = and > num_users") {
+    val model = getALSModel
+    val numUsers = model.userFactors.count
+    val expected = Map(
+      0 -> Array(/* (0, 1.0f), */(1, 0.9429f), (2, 0.8682f)),
+      1 -> Array(/* (1, 1.0f), */(2, 0.9838f), (0, 0.9429f)),
+      2 -> Array(/* (2, 1.0f), */(1, 0.9838f), (0, 0.8682f))
+    )
+
+    Seq(1, 2, 3).foreach { k =>
+      val n = math.min(k, numUsers).toInt
+      val expectedUpToN = expected.mapValues(_.slice(0, n))
+      val similarUsers = model.similarUsers(k)
+      assert(similarUsers.count() == numUsers)
+      assert(similarUsers.columns.contains("user"))
+      checkRecommendations(similarUsers, expectedUpToN, "user")
+    }
+  }
+
+  test("similarItems with k <, = and > num_items") {
+    val model = getALSModel
+    val numItems = model.itemFactors.count
+    val expected = Map(
+      3 -> Array(/* (3, 1.0f), */(5, 0.9734f), (4, 0.8502f), (6, 0.8073f)),
+      4 -> Array(/* (4, 1.0f), */(6, 0.9970f), (3, 0.8502f), (5, 0.7071f)),
+      5 -> Array(/* (5, 1.0f), */(3, 0.9734f), (4, 0.7071f), (6, 0.6507f)),
+      6 -> Array(/* (6, 1.0f), */(4, 0.9970f), (3, 0.8073f), (5, 0.6507f))
+    )
+
+    Seq(2, 3, 4).foreach { k =>
+      val n = math.min(k, numItems).toInt
+      val expectedUpToN = expected.mapValues(_.slice(0, n))
+      val similarItems = model.similarItems(k)
+      assert(similarItems.count() == numItems)
+      assert(similarItems.columns.contains("item"))
+      checkRecommendations(similarItems, expectedUpToN, "item")
+    }
+  }
+
   private def checkRecommendations(
       topK: DataFrame,
       expected: Map[Int, Array[(Int, Float)]],
@@ -721,7 +760,9 @@ class ALSSuite
 
     assert(topK.columns.contains("recommendations"))
     topK.as[(Int, Seq[(Int, Float)])].collect().foreach { case (id: Int, recs: Seq[(Int, Float)]) =>
-      assert(recs === expected(id))
+      assert(recs.zip(expected(id)).forall { case ((recId, recScore), (expId, expScore)) =>
+        (recId === expId) && (recScore.toDouble ~== expScore.toDouble relTol 1e-3)
+      })
     }
     topK.collect().foreach { row =>
       val recs = row.getAs[WrappedArray[Row]]("recommendations")
